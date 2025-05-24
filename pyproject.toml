@@ -1,0 +1,28 @@
+[project]
+name = "odefit-template"
+version = "0.1.0"
+description = "A user-friendly Python package for parameter estimation and system identification of nonlinear ODE models"
+readme = "README.md"
+authors = [
+    { name = "Fabian Müller", email = "fabianmueller100295@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "lmfit>=1.2.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.scripts]
+odefit-template = "odefit_template:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+    "ruff>=0.11.11",
+]

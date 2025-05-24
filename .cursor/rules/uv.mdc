@@ -1,0 +1,10 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+We use uv for dependency management, python version management, virtual environments and so on.
+
+Whenever adding dependencies DO NOT modify the [pyproject.toml](mdc:pyproject.toml) directly, but rather always use `uv add [package name]` in order to add new dependencies. and related commands to indirectly modify the [pyproject.toml](mdc:pyproject.toml).
+
+To run examples and main scipts do not call `python` to run the script, but use `uv run`.
