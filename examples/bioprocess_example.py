@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
 """
-Bioprocess ODE parameter estimation example with competitive inhibition kinetics.
+Bioprocess ODE parameter estimation example with competitive inhibition kinetics and acetate production.
 
 This example demonstrates:
-1. A three-state bioprocess model: biomass growth with sequential substrate utilization
+1. A four-state bioprocess model: biomass growth with sequential substrate utilization and acetate production
 2. Competitive inhibition kinetics (glucose inhibits galactose uptake)
-3. Cell death kinetics to model biomass decay
-4. Generate synthetic measurement data with realistic bioprocess noise
-5. Identify kinetic parameters (half-saturation constants, inhibition constant, death rate)
-6. Low-frequency measurements (hourly) as typical in bioprocesses
+3. Growth-coupled acetate production (overflow metabolism)
+4. Cell death kinetics to model biomass decay
+5. Generate synthetic measurement data with realistic bioprocess noise
+6. Identify kinetic parameters (half-saturation constants, inhibition constant, death rate, acetate yield)
+7. Low-frequency measurements (hourly) as typical in bioprocesses
 
-Model equations with competitive inhibition and cell death:
+Model equations with competitive inhibition, maintenance deficit-based death, and acetate production:
 - μ_glc = S_glc / (Ks_glc + S_glc)  [glucose utilization]
 - μ_gal = S_gal / (Ks_gal + S_gal) * Ki_glc / (Ki_glc + S_glc)  [galactose utilization with glucose inhibition]
 - μ_total = μ_max * (μ_glc + μ_gal)  [total growth rate]
+- maintenance_shortfall = max(0, μ_maintenance - μ_total)  [growth deficit]
+- k_d_effective = k_d_aging * Deficit / (deficit_half + Deficit)  [aging-based death]
 
-- dX/dt = μ_total * X - k_d * X  [biomass growth minus death]
+- dX/dt = μ_total * X - k_d_effective * X  [biomass growth minus aging-based death]
 - dS_glc/dt = -1/Y_glc * μ_max * μ_glc * X  
 - dS_gal/dt = -1/Y_gal * μ_max * μ_gal * X
+- dAcetate/dt = Y_acetate * μ_total * X  [growth-coupled acetate production]
+- dDeficit/dt = maintenance_shortfall  [accumulation of maintenance deficit]
 
 Where:
 - X = biomass concentration [g/L]
 - S_glc = glucose concentration [g/L] 
 - S_gal = galactose concentration [g/L]
+- Acetate = acetate concentration [g/L]
+- Deficit = accumulated maintenance deficit [dimensionless]
 - μ_max = maximum specific growth rate [1/h]
 - Ks_glc, Ks_gal = half-saturation constants [g/L]
 - Ki_glc = inhibition constant for glucose on galactose uptake [g/L]
-- k_d = cell death rate constant [1/h]
+- μ_maintenance = minimum growth rate for cell maintenance [1/h]
+- k_d_aging = death rate coefficient due to maintenance deficit [1/h]
+- deficit_half = half-saturation for maintenance deficit effects [dimensionless]
 - Y_glc, Y_gal = yield coefficients [g_biomass/g_substrate]
+- Y_acetate = acetate yield coefficient [g_acetate/g_biomass] (overflow metabolism)
 """
 
 import numpy as np
@@ -37,53 +47,117 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.odefit_template import Parameter, ODESystemFitter
 
+# ============================================================================
+# BIOPROCESS MODEL CONFIGURATION
+# ============================================================================
+# Modify these parameters to customize the bioprocess model
+
+# Initial conditions [X, S_glc, S_gal, Acetate, Maintenance_deficit] in g/L and dimensionless
+INITIAL_CONDITIONS = np.array([0.1, 10.0, 5.0, 0.0, 0.0])
+
+# True parameter values (for synthetic data generation)
+TRUE_PARAMETERS = {
+    'mu_max': 0.5,        # [1/h] - maximum specific growth rate
+    'Ks_glc': 0.3,        # [g/L] - glucose half-saturation constant
+    'Ks_gal': 4.0,        # [g/L] - galactose half-saturation constant (higher than glucose)
+    'Ki_glc': 0.2,        # [g/L] - glucose inhibition constant (low = strong inhibition)
+    'mu_maintenance': 0.05, # [1/h] - minimum growth rate required for cell maintenance
+    'k_d_aging': 0.13,    # [1/h] - death rate coefficient due to maintenance deficit
+    'deficit_half': 2.0,  # [dimensionless] - half-saturation for maintenance deficit effects
+    'Y_glc': 0.5,         # [g_biomass/g_glucose] - glucose yield coefficient
+    'Y_gal': 0.4,         # [g_biomass/g_galactose] - galactose yield coefficient
+    'Y_acetate': 0.15     # [g_acetate/g_biomass] - acetate yield (overflow metabolism)
+}
+
+# Parameter estimation setup
+PARAMETERS_TO_FIT = [
+    # Parameter(name, initial_guess, min_bound, max_bound, vary)
+    ('mu_max', 0.4, 0.1, 1.0, True),
+    ('Ks_glc', 0.2, 0.01, 2.0, True),
+    ('Ks_gal', 0.8, 0.01, 3.0, True),
+    ('Ki_glc', 0.5, 0.01, 1.0, True),
+    ('mu_maintenance', 0.015, 0.005, 0.05, True),         # Estimate maintenance threshold
+    ('k_d_aging', 0.06, 0.02, 0.15, True),               # Estimate aging death coefficient  
+    ('deficit_half', 1.5, 0.5, 5.0, True),               # Estimate deficit half-saturation
+    ('Y_glc', TRUE_PARAMETERS['Y_glc'], 0.1, 1.0, False),  # Fixed
+    ('Y_gal', TRUE_PARAMETERS['Y_gal'], 0.1, 1.0, False),  # Fixed
+    ('Y_acetate', 0.1, 0.05, 0.3, True)  # Estimate acetate yield
+]
+
+# Time configuration
+TIME_START = 0.0          # [h] - start time
+TIME_END = 24.0           # [h] - end time  
+TIME_STEP = 1.0           # [h] - measurement interval (hourly sampling)
+
+# Noise configuration (realistic bioprocess measurement uncertainties)
+NOISE_LEVELS = {
+    'biomass': 0.05,      # 5% noise for biomass (optical density, dry weight)
+    'glucose': 0.02,      # 2% noise for glucose (HPLC, enzymatic assays)
+    'galactose': 0.02,    # 2% noise for galactose (HPLC, enzymatic assays)
+    'acetate': 0.03       # 3% noise for acetate (HPLC, GC-MS)
+}
+
+# Random seed for reproducible results
+RANDOM_SEED = 42
+
+# ============================================================================
+# BIOPROCESS MODEL IMPLEMENTATION
+# ============================================================================
 
 def bioprocess_example():
-    """Run a bioprocess parameter estimation example with competitive inhibition kinetics."""
+    """Run a bioprocess parameter estimation example with competitive inhibition kinetics and acetate production."""
     
-    print("="*70)
-    print("BIOPROCESS PARAMETER ESTIMATION EXAMPLE")
-    print("="*70)
-    print("Model: Competitive inhibition kinetics (glucose inhibits galactose)")
-    print("States: Biomass, Glucose, Galactose")
-    print("Parameters to identify: Ks_glucose, Ks_galactose, Ki_glucose, k_death")
-    print("Measurements: All three states (hourly sampling)")
+    print("="*80)
+    print("BIOPROCESS PARAMETER ESTIMATION EXAMPLE WITH ACETATE PRODUCTION")
+    print("="*80)
+    print("Model: Competitive inhibition kinetics + growth-coupled acetate production + maintenance deficit-based death")
+    print("States: Biomass, Glucose, Galactose, Acetate")
+    print("Parameters to identify: Ks_glucose, Ks_galactose, Ki_glucose, death kinetics, Y_acetate")
+    print("Measurements: All four states (hourly sampling)")
     
-    # Step 1: Define the bioprocess ODE system with competitive inhibition
+    # Step 1: Define the bioprocess ODE system with competitive inhibition and acetate production
     def bioprocess_dynamics(t, x, u, p):
         """
-        Define the competitive inhibition bioprocess model with cell death.
+        Define the competitive inhibition bioprocess model with maintenance deficit-based death and acetate production.
         
         Args:
             t: time [h]
-            x: state vector [biomass, glucose, galactose] [g/L]
+            x: state vector [biomass, glucose, galactose, acetate, maintenance_deficit] [g/L, dimensionless]
             u: inputs (none in this example)
             p: parameters dict {
                 'mu_max': maximum growth rate [1/h],
                 'Ks_glc': glucose half-saturation constant [g/L],
                 'Ks_gal': galactose half-saturation constant [g/L],
                 'Ki_glc': glucose inhibition constant for galactose uptake [g/L],
-                'k_d': cell death rate constant [1/h],
+                'mu_maintenance': minimum growth rate for cell maintenance [1/h],
+                'k_d_aging': death rate coefficient due to maintenance deficit [1/h],
+                'deficit_half': half-saturation for maintenance deficit effects [dimensionless],
                 'Y_glc': glucose yield coefficient [g_biomass/g_glucose],
-                'Y_gal': galactose yield coefficient [g_biomass/g_galactose]
+                'Y_gal': galactose yield coefficient [g_biomass/g_galactose],
+                'Y_acetate': acetate yield coefficient [g_acetate/g_biomass]
             }
         
         Returns:
-            dx/dt: [dX/dt, dS_glc/dt, dS_gal/dt]
+            dx/dt: [dX/dt, dS_glc/dt, dS_gal/dt, dAcetate/dt, dDeficit/dt]
         """
         # Extract states
         X = x[0]        # Biomass [g/L]
         S_glc = x[1]    # Glucose [g/L] 
         S_gal = x[2]    # Galactose [g/L]
+        Acetate = x[3]  # Acetate [g/L]
+        Deficit = x[4]  # Accumulated maintenance deficit [dimensionless]
         
         # Extract parameters
         mu_max = p['mu_max']
         Ks_glc = p['Ks_glc']
         Ks_gal = p['Ks_gal']
         Ki_glc = p['Ki_glc']
-        k_d = p['k_d']  # Cell death rate
+        mu_maintenance = p['mu_maintenance']
+        k_d_aging = p['k_d_aging']
+        deficit_half = p['deficit_half']
         Y_glc = p['Y_glc']
         Y_gal = p['Y_gal']
+        Y_acetate = p['Y_acetate']
         
         # Competitive inhibition kinetics
         mu_glc = S_glc / (Ks_glc + S_glc)  # Glucose uptake (normal Monod)
@@ -100,117 +174,99 @@ def bioprocess_example():
         mu_glc_actual = mu_max * mu_glc
         mu_gal_actual = mu_max * mu_gal
         
-        # ODE equations with cell death
-        dX_dt = mu_total * X - k_d * X                     # Biomass growth minus death
-        dS_glc_dt = -(1/Y_glc) * mu_glc_actual * X         # Glucose consumption
-        dS_gal_dt = -(1/Y_gal) * mu_gal_actual * X         # Galactose consumption
+        # Maintenance deficit dynamics
+        # When growth rate < maintenance: accumulate deficit
+        # When growth rate >= maintenance: no additional deficit (but existing deficit persists)
+        maintenance_shortfall = max(0, mu_maintenance - mu_total)
         
-        return [dX_dt, dS_glc_dt, dS_gal_dt]
+        # Death rate based on accumulated maintenance deficit
+        # Uses Monod-like kinetics: k_d = k_d_aging * Deficit / (deficit_half + Deficit)
+        k_d_effective = k_d_aging * Deficit / (deficit_half + Deficit)
+        
+        # ODE equations with maintenance deficit-based death and acetate production
+        dX_dt = mu_total * X - k_d_effective * X               # Biomass growth minus aging-based death
+        dS_glc_dt = -(1/Y_glc) * mu_glc_actual * X             # Glucose consumption
+        dS_gal_dt = -(1/Y_gal) * mu_gal_actual * X             # Galactose consumption
+        dAcetate_dt = Y_acetate * mu_total * X                 # Growth-coupled acetate production
+        dDeficit_dt = maintenance_shortfall                    # Accumulation of maintenance deficit
+        
+        return [dX_dt, dS_glc_dt, dS_gal_dt, dAcetate_dt, dDeficit_dt]
     
     # Step 2: Define the measurement function
     def measurement_function(t, x, u, p):
         """
         Define what we can measure in the bioprocess.
-        We measure all three states: biomass, glucose, galactose.
+        We measure the four observable states: biomass, glucose, galactose, acetate.
+        The maintenance deficit is an internal state variable (not directly measurable).
         
         Returns:
-            y: [biomass, glucose, galactose] [g/L]
+            y: [biomass, glucose, galactose, acetate] [g/L]
         """
-        return [x[0], x[1], x[2]]  # Measure all three states
+        return [x[0], x[1], x[2], x[3]]  # Measure first four states (not the deficit)
     
-    # Step 3: Set up true parameters and generate synthetic data
+    # Step 3: Set up time points and generate synthetic data
     print("\nGenerating synthetic bioprocess data...")
+    print(f"Configuration:")
+    print(f"  Time range: {TIME_START:.0f} - {TIME_END:.0f} h (every {TIME_STEP:.1f} h)")
+    print(f"  Initial conditions: X={INITIAL_CONDITIONS[0]:.1f}, Glc={INITIAL_CONDITIONS[1]:.1f}, Gal={INITIAL_CONDITIONS[2]:.1f}, Ace={INITIAL_CONDITIONS[3]:.1f}, Def={INITIAL_CONDITIONS[4]:.1f}")
     
-    # True parameter values (typical for E. coli or yeast with catabolite repression)
-    true_mu_max = 0.5     # [1/h] - reasonable growth rate
-    true_Ks_glc = 0.1     # [g/L] - glucose half-saturation
-    true_Ks_gal = 4.0     # [g/L] - galactose half-saturation (higher than glucose)
-    true_Ki_glc = 0.2     # [g/L] - glucose inhibition constant (low value means strong inhibition)
-    true_k_d = 0.05       # [1/h] - cell death rate (small but realistic)
-    true_Y_glc = 0.5      # [g/g] - glucose yield coefficient  
-    true_Y_gal = 0.4      # [g/g] - galactose yield coefficient (lower than glucose)
-    
-    true_params = {
-        'mu_max': true_mu_max,
-        'Ks_glc': true_Ks_glc, 
-        'Ks_gal': true_Ks_gal,
-        'Ki_glc': true_Ki_glc,
-        'k_d': true_k_d,
-        'Y_glc': true_Y_glc,
-        'Y_gal': true_Y_gal
-    }
-    
-    # Initial conditions: small biomass, abundant substrates
-    initial_conditions = np.array([0.1, 10.0, 5.0])  # [X, S_glc, S_gal] in g/L
-    
-    # Time points for measurement (hourly for 24 hours)
-    time_points = np.arange(0, 25, 1.0)  # Every hour for 24 hours
+    # Time points for measurement
+    time_points = np.arange(TIME_START, TIME_END + TIME_STEP, TIME_STEP)
     
     # Generate true data by solving the ODE with true parameters
     from scipy.integrate import solve_ivp
     
     def true_bioprocess_system(t, x):
-        return bioprocess_dynamics(t, x, np.array([]), true_params)
+        return bioprocess_dynamics(t, x, np.array([]), TRUE_PARAMETERS)
     
     # Solve the true system
     true_solution = solve_ivp(
         true_bioprocess_system,
         [time_points[0], time_points[-1]],
-        initial_conditions,
+        INITIAL_CONDITIONS,
         t_eval=time_points,
         method='RK45',
         rtol=1e-9
     )
     
     # Create measurements with realistic bioprocess noise
-    np.random.seed(42)  # For reproducible results
+    np.random.seed(RANDOM_SEED)
     
-    # Different noise levels for different measurements (realistic)
-    biomass_noise = 0.05    # 5% noise for biomass (harder to measure accurately)
-    substrate_noise = 0.02  # 2% noise for substrates (more accurate analytical methods)
-    
-    true_measurements = true_solution.y.T  # Shape: [time_points, states]
+    # Extract only the measurable states (first 4: biomass, glucose, galactose, acetate)
+    # The 5th state (maintenance deficit) is internal and not directly measurable
+    true_measurements = true_solution.y[:4, :].T  # Shape: [time_points, 4_measurable_states]
     noisy_measurements = true_measurements.copy()
     
     # Add noise to each measurement type
-    noisy_measurements[:, 0] += np.random.normal(0, biomass_noise, len(time_points))    # Biomass
-    noisy_measurements[:, 1] += np.random.normal(0, substrate_noise, len(time_points))  # Glucose
-    noisy_measurements[:, 2] += np.random.normal(0, substrate_noise, len(time_points))  # Galactose
+    noisy_measurements[:, 0] += np.random.normal(0, NOISE_LEVELS['biomass'], len(time_points))     # Biomass
+    noisy_measurements[:, 1] += np.random.normal(0, NOISE_LEVELS['glucose'], len(time_points))     # Glucose
+    noisy_measurements[:, 2] += np.random.normal(0, NOISE_LEVELS['galactose'], len(time_points))   # Galactose
+    noisy_measurements[:, 3] += np.random.normal(0, NOISE_LEVELS['acetate'], len(time_points))     # Acetate
     
     # Ensure no negative concentrations
     noisy_measurements = np.maximum(noisy_measurements, 0.01)
     
     print(f"Generated {len(time_points)} hourly data points")
     print(f"True parameters:")
-    print(f"  μ_max = {true_mu_max:.3f} [1/h]")
-    print(f"  Ks_glucose = {true_Ks_glc:.3f} [g/L]")  
-    print(f"  Ks_galactose = {true_Ks_gal:.3f} [g/L]")
-    print(f"  Ki_glucose = {true_Ki_glc:.3f} [g/L] (inhibition constant)")
-    print(f"  k_d = {true_k_d:.3f} [1/h] (death rate)")
-    print(f"  Y_glucose = {true_Y_glc:.3f} [g/g]")
-    print(f"  Y_galactose = {true_Y_gal:.3f} [g/g]")
-    print(f"Initial conditions: X={initial_conditions[0]:.1f}, Glc={initial_conditions[1]:.1f}, Gal={initial_conditions[2]:.1f} [g/L]")
+    for param_name, value in TRUE_PARAMETERS.items():
+        print(f"  {param_name} = {value:.3f}")
     
     # Step 4: Set up parameter estimation
     print("\nSetting up parameter estimation...")
-    print("Focus: Estimating the half-saturation constants and inhibition constant")
+    print("Focus: Estimating kinetic constants and acetate yield coefficient")
     
-    # Define parameters to estimate - focus on the kinetic constants
-    # Keep other parameters fixed for this example
-    parameters_to_fit = [
-        Parameter(name='mu_max', value=0.4, min=0.1, max=1.0, vary=True),      # Estimate max growth rate
-        Parameter(name='Ks_glc', value=0.2, min=0.01, max=2.0, vary=True),     # Estimate glucose Ks
-        Parameter(name='Ks_gal', value=0.8, min=0.01, max=3.0, vary=True),     # Estimate galactose Ks  
-        Parameter(name='Ki_glc', value=0.5, min=0.01, max=1.0, vary=True),     # Estimate glucose inhibition constant
-        Parameter(name='k_d', value=0.03, min=0.001, max=0.2, vary=True),      # Estimate death rate
-        Parameter(name='Y_glc', value=true_Y_glc, vary=False),                  # Fix glucose yield
-        Parameter(name='Y_gal', value=true_Y_gal, vary=False),                  # Fix galactose yield
-    ]
+    # Define parameters to estimate
+    parameters_to_fit = []
+    for param_name, initial_guess, min_bound, max_bound, vary in PARAMETERS_TO_FIT:
+        parameters_to_fit.append(
+            Parameter(name=param_name, value=initial_guess, min=min_bound, max=max_bound, vary=vary)
+        )
     
     print("Parameters to estimate:")
     for param in parameters_to_fit:
         if param.vary:
-            print(f"  {param.name}: initial guess = {param.value:.3f} (true = {true_params[param.name]:.3f})")
+            true_val = TRUE_PARAMETERS.get(param.name, 'N/A')
+            print(f"  {param.name}: initial guess = {param.value:.3f} (true = {true_val:.3f})")
         else:
             print(f"  {param.name}: fixed at {param.value:.3f}")
     
@@ -218,7 +274,7 @@ def bioprocess_example():
     model = ODESystemFitter.Model(
         sys_func=bioprocess_dynamics,
         output_func=measurement_function,
-        initial_conditions=initial_conditions,
+        initial_conditions=INITIAL_CONDITIONS,
         parameters=parameters_to_fit
     )
     
@@ -238,24 +294,26 @@ def bioprocess_example():
     # Step 6: Analyze results
     fitted_params = result.params.valuesdict()
     
-    print("\n" + "="*70)
+    print("\n" + "="*80)
     print("BIOPROCESS PARAMETER ESTIMATION RESULTS")
-    print("="*70)
+    print("="*80)
     
     print("Parameter Comparison:")
     param_errors = {}
-    for param_name in ['mu_max', 'Ks_glc', 'Ks_gal', 'Ki_glc', 'k_d']:
-        true_val = true_params[param_name]
-        fitted_val = fitted_params[param_name]
-        error = abs(fitted_val - true_val)
-        rel_error = error / true_val * 100
-        param_errors[param_name] = rel_error
-        
-        print(f"  {param_name:8}: True={true_val:.4f}, Fitted={fitted_val:.4f}, Error={error:.4f} ({rel_error:.1f}%)")
+    for param_name in ['mu_max', 'Ks_glc', 'Ks_gal', 'Ki_glc', 'k_d_aging', 'deficit_half', 'Y_acetate']:
+        if param_name in fitted_params and param_name in TRUE_PARAMETERS:
+            true_val = TRUE_PARAMETERS[param_name]
+            fitted_val = fitted_params[param_name]
+            error = abs(fitted_val - true_val)
+            rel_error = error / true_val * 100
+            param_errors[param_name] = rel_error
+            
+            print(f"  {param_name:10}: True={true_val:.4f}, Fitted={fitted_val:.4f}, Error={error:.4f} ({rel_error:.1f}%)")
     
     # Calculate overall parameter discrepancy
-    total_discrepancy = np.sqrt(sum((fitted_params[name] - true_params[name])**2 
-                                   for name in ['mu_max', 'Ks_glc', 'Ks_gal', 'Ki_glc', 'k_d']))
+    total_discrepancy = np.sqrt(sum((fitted_params[name] - TRUE_PARAMETERS[name])**2 
+                                   for name in ['mu_max', 'Ks_glc', 'Ks_gal', 'Ki_glc', 'k_d_aging', 'deficit_half', 'Y_acetate']
+                                   if name in fitted_params))
     
     print(f"\nOverall Parameter Discrepancy (L2 norm): {total_discrepancy:.4f}")
     print(f"Optimization Success: {result.success}")
@@ -275,16 +333,17 @@ def bioprocess_example():
     
     # Show final biomass and substrate predictions
     print(f"\nFinal state predictions (t = {time_points[-1]:.0f}h):")
-    final_sim = fitter._simulate(fitted_params)[-1, :]
-    final_measured = noisy_measurements[-1, :]
+    final_sim = fitter._simulate(fitted_params)[-1, :]  # This returns 4 measurable states
+    final_measured = noisy_measurements[-1, :]          # This has 4 measurable states
     
     print(f"  Biomass:   Predicted={final_sim[0]:.2f}, Measured={final_measured[0]:.2f} [g/L]")
     print(f"  Glucose:   Predicted={final_sim[1]:.2f}, Measured={final_measured[1]:.2f} [g/L]")
     print(f"  Galactose: Predicted={final_sim[2]:.2f}, Measured={final_measured[2]:.2f} [g/L]")
+    print(f"  Acetate:   Predicted={final_sim[3]:.2f}, Measured={final_measured[3]:.2f} [g/L]")
     
     # Custom plotting function to show all states in one plot
     def plot_bioprocess_results(fitter, fitted_params):
-        """Custom plotting function to show all three states in one plot."""
+        """Custom plotting function to show all four states in one plot."""
         import matplotlib.pyplot as plt
         
         # Simulate with fitted parameters
@@ -296,9 +355,9 @@ def bioprocess_example():
         fig, ax = plt.subplots(1, 1, figsize=(12, 8))
         
         # Define colors and labels for each state
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # Blue, Orange, Green
-        labels = ['Biomass [g/L]', 'Glucose [g/L]', 'Galactose [g/L]']
-        markers = ['o', 's', '^']
+        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # Blue, Orange, Green, Red
+        labels = ['Biomass [g/L]', 'Glucose [g/L]', 'Galactose [g/L]', 'Acetate [g/L]']
+        markers = ['o', 's', '^', 'x']
         
         # Plot measured data and fitted curves
         for i in range(measurements.shape[1]):
@@ -316,7 +375,7 @@ def bioprocess_example():
         # Customize plot
         ax.set_xlabel('Time [h]', fontsize=14)
         ax.set_ylabel('Concentration [g/L]', fontsize=14)
-        ax.set_title('Bioprocess Model: Competitive Inhibition with Cell Death', fontsize=16, fontweight='bold')
+        ax.set_title('Bioprocess Model: Competitive Inhibition with Cell Death and Acetate Production', fontsize=16, fontweight='bold')
         ax.legend(loc='center right', fontsize=11, framealpha=0.9)
         ax.grid(True, alpha=0.3)
         ax.tick_params(labelsize=12)
@@ -327,7 +386,9 @@ def bioprocess_example():
 Ks_glc = {fitted_params['Ks_glc']:.3f} [g/L]
 Ks_gal = {fitted_params['Ks_gal']:.3f} [g/L]
 Ki_glc = {fitted_params['Ki_glc']:.3f} [g/L]
-k_d = {fitted_params['k_d']:.3f} [1/h]"""
+k_d_aging = {fitted_params['k_d_aging']:.3f} [1/h]
+deficit_half = {fitted_params['deficit_half']:.3f} [dimensionless]
+Y_acetate = {fitted_params['Y_acetate']:.3f} [g_acetate/g_biomass]"""
         
         ax.text(0.02, 0.98, param_text, transform=ax.transAxes, fontsize=10,
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
@@ -355,7 +416,7 @@ k_d = {fitted_params['k_d']:.3f} [1/h]"""
         print(f"⚠️  Could not display plots: {e}")
         print("   This is normal when running in non-interactive environments.")
     
-    print("="*70)
+    print("="*80)
     
     return result, fitted_params
 
@@ -364,20 +425,31 @@ if __name__ == "__main__":
     # Run the bioprocess example
     result, fitted_params = bioprocess_example()
     
-    print("\nBioprocess example completed successfully!")
+    print("\nBioprocess example with acetate production completed successfully!")
     print("The library demonstrated:")
-    print("✓ Complex multi-state bioprocess model")
+    print("✓ Complex multi-state bioprocess model (4 states)")
     print("✓ Competitive inhibition kinetics")
+    print("✓ Growth-coupled acetate production (overflow metabolism)")
     print("✓ Realistic hourly measurement frequency")
     print("✓ Multiple parameter estimation with constraints")
     print("✓ Bioprocess-specific noise modeling")
+    print("✓ Configuration-driven parameter setup")
     
     print("\nBioprocess Insights:")
     print("- Glucose inhibits galactose uptake, creating sequential utilization")
     print("- Lower Ki_glc values mean stronger inhibition (more pronounced diauxic growth)")
-    print("- Cell death rate k_d affects biomass dynamics and yield estimation")
+    print("- Maintenance deficit death: cells accumulate damage when μ < μ_maintenance")
+    print("- deficit_half defines the deficit level where death rate becomes significant")
+    print("- k_d_aging controls the maximum death rate due to accumulated damage")
+    print("- Death kinetics: k_d = k_d_aging * Deficit / (deficit_half + Deficit)")
+    print("- μ_maintenance represents minimum growth needed for cellular maintenance")
+    print("- Deficit accumulates over time when cells can't meet maintenance requirements")
     print("- Competitive inhibition models capture catabolite repression effects")  
+    print("- Acetate production is growth-coupled (overflow metabolism)")
+    print("- Y_acetate represents the fraction of growth that produces acetate")
     print("- Low measurement frequency challenges parameter identifiability")
     print("- Yield coefficients are often easier to estimate than kinetic constants")
     print("- This model shows diauxic growth patterns common in microbiology")
-    print("- Including cell death makes the model more realistic for longer fermentations")
+    print("- Maintenance deficit creates realistic aging-based death progression")
+    print("- Acetate accumulation is typical in high-glucose, aerobic fermentations")
+    print("- Death kinetics: growth → stationary → progressive cellular aging death")
